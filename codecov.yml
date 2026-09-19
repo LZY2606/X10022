@@ -1,0 +1,45 @@
+# https://docs.codecov.com/docs/codecov-yaml
+codecov:
+  # Every job of the test matrix uploads its own report. Waiting for CI to
+  # finish keeps the comment and the statuses off a partial set of uploads,
+  # without pinning a build count that the matrix would drift away from.
+  require_ci_to_pass: true
+
+coverage:
+  precision: 2
+  round: down
+  range: "70...90"
+  status:
+    project:
+      default:
+        target: auto
+        # Don't fail a pull request over the rounding noise of a refactor
+        # that only moves code around.
+        threshold: 0.5%
+    patch:
+      default:
+        target: 80%
+        threshold: 5%
+
+# The test suite is measured alongside the library, so the overall number
+# blends the two. These components report on each separately: `traitlets` is
+# the one to watch, while `tests` mostly surfaces test code that never runs.
+component_management:
+  default_rules:
+    statuses:
+      - type: project
+        target: auto
+        threshold: 0.5%
+  individual_components:
+    - component_id: library
+      name: traitlets
+      paths:
+        - traitlets/**
+    - component_id: tests
+      name: tests
+      paths:
+        - tests/**
+
+comment:
+  layout: "condensed_header, components, condensed_files, condensed_footer"
+  require_changes: true
