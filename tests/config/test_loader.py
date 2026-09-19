@@ -631,10 +631,13 @@ class TestConfig(TestCase):
         assert "extend" in cfg_repr
         assert " [1]}>" in cfg_repr
         assert "value=" not in cfg_repr
-        cfg.Class.lazy.get_value([0])
+        value = cfg.Class.lazy.get_value([0])
+        assert value == [0, 1]
+        # reifying does not store state on the shared lazy object:
+        # the repr still shows only the recorded operations
         repr2 = repr(cfg)
-        assert repr([0, 1]) in repr2
-        assert "value=" in repr2
+        assert repr2 == cfg_repr
+        assert "value=" not in repr2
 
     def test_getitem_not_section(self):
         cfg = Config()

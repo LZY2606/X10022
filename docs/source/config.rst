@@ -488,6 +488,137 @@ This class hierarchy and configuration file accomplishes the following:
   it doesn't know anything about the :attr:`othervalue` attribute.
 
 
+.. _config_evaluation_order:
+
+Evaluation order and cache boundaries
+=====================================
+
+This section pins down exactly how a value travels from configuration to a
+trait on an instance: which callbacks run, in which order, and what is
+cached where. It covers the three paths that can produce a trait value —
+first read of a default, loading of (possibly stacked) ``Config`` objects,
+and explicit assignment — and how class hierarchies interact with each.
+
+Lazy container updates: ``LazyConfigValue``
+-------------------------------------------
+
+Appending to a list, updating a dict, or adding to a set in a config file
+does **not** happen immediately::
+
+    c = get_config()  # noqa
+    c.MyClass.items.append("x")
+
+``c.MyClass.items`` is a :class:`~traitlets.config.loader.LazyConfigValue`:
+a pure recorder of incremental operations (``append``/``extend``/``insert``/
+``prepend`` for lists, ``update`` for dicts, ``update``/``add`` for sets).
+It records *only* the operations — never a computed container — so the same
+lazy object can sit in a shared ``Config`` and be reified independently
+against every instance (and every class default) that loads it.
+
+Multiple stacked configs
+------------------------
+
+When several ``Config`` objects are merged — system-wide config, user
+config, ``Application.update_config`` — later (higher-precedence) configs
+compose with earlier ones:
+
+* plain values *replace* earlier plain values;
+* lazy increments *compose*: ``merge`` produces a **new**
+  ``LazyConfigValue`` whose operations are the concatenation of both
+  (lower-precedence operations first). Neither source object is mutated
+  and no operation lists are aliased, so the sources stay valid for
+  further independent use.
+
+.. code-block:: python
+
+    c1 = Config()
+    c1.C.items.append(1)   # system-wide
+    c2 = Config()
+    c2.C.items.append(2)   # user config, higher precedence
+    c = Config()
+    c.merge(c1)
+    c.merge(c2)
+    # c.C.items records extend([1]) then extend([2]); c1 and c2 unchanged
+
+Class hierarchy inheritance
+---------------------------
+
+:meth:`Configurable._find_my_config` merges every config section named
+after a class in the instance's MRO, base classes first, so a subclass
+section has higher precedence than the base class section. Lazy increments
+from *both* sections compose in that order:
+
+.. code-block:: python
+
+    class Base(Configurable):
+        items = List([0], config=True)
+
+    class Derived(Base):
+        pass
+
+    c.Base.items.append(1)
+    c.Derived.items.append(2)
+    # Derived(config=c).items == [0, 1, 2]
+    # Base(config=c).items   == [0, 1]   (Base never sees Derived's section)
+
+Path 1: first read of a default
+-------------------------------
+
+Reading an unset trait (``obj.items``) runs, in order:
+
+1. the class default (``List([0])``) or the ``@default`` generator;
+2. the trait's own type validation (e.g. list coercion) — the
+   cross-validation lock is held, so a ``@validate`` handler does **not**
+   run on defaults;
+3. the value is cached in the instance's ``_trait_values`` (this is the
+   *instance* cache boundary: later reads are served from it and no
+   callback runs again);
+4. a ``type="default"`` notification is delivered synchronously to any
+   observer registered with ``@observe("items", type="default")``.
+
+Path 2: config loading
+----------------------
+
+Loading config (constructor ``config=``, ``update_config``, or assigning
+``obj.config``) happens inside :meth:`HasTraits.hold_trait_notifications`:
+
+1. the current value (usually the default, via path 1) is read as the
+   *initial* value;
+2. each ``LazyConfigValue`` is reified against a deep copy of that initial
+   value — per instance, never cached on the shared lazy object;
+3. the merged value passes the trait's type validation and is stored;
+4. when the hold is released, ``@validate`` cross-validators run exactly
+   once on the *final* merged value, then the held ``change`` notifications
+   fire (observers see ``old=<default>``, ``new=<configured value>``).
+
+Two cache-boundary guarantees apply here:
+
+* **No cross-instance pollution.** Reification state lives only on the
+  instance. Two instances — even of different classes with different
+  ``@default`` generators — loading one shared ``Config`` each apply the
+  increments to their own default, and mutating one instance's container
+  never affects the other instance or the ``Config``.
+* **Idempotent re-loads.** Each instance remembers which lazy increments
+  it has already applied (via a lineage marker carried by every
+  ``LazyConfigValue`` through merges and deep copies). Loading the same
+  config twice — e.g. repeated ``update_config`` calls — does not apply
+  the increments twice.
+
+Path 3: explicit assignment
+---------------------------
+
+``obj.items = [5]`` runs synchronously: the trait's type validation, then
+the ``@validate`` cross-validator, then storage, then the ``change``
+notification. Constructor keyword arguments count as explicit assignment
+and are re-applied *after* config loading, so ``C(config=c, items=[5])``
+always ends with ``[5]`` regardless of what the config says.
+
+Errors on any path keep their context: a bad config value raises
+``TraitError`` naming the trait and the owning class, and a ``@validate``
+failure during config loading rolls the instance back to its pre-load
+values before the error propagates.
+
+
 .. _commandline:
 
 Command-line arguments

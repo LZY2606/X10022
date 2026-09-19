@@ -192,7 +192,7 @@ class Configurable(HasTraits):
                         # ConfigValue is a wrapper for using append / update on containers
                         # without having to copy the initial value
                         initial = getattr(self, name)
-                        config_value = config_value.get_value(initial)
+                        config_value = self._reify_lazy_config_value(name, config_value, initial)
                     elif isinstance(config_value, DeferredConfig):
                         # DeferredConfig tends to come from CLI/environment variables
                         config_value = config_value.get_value(traits[name])
@@ -221,6 +221,37 @@ class Configurable(HasTraits):
                             matches=", ".join(sorted(matches))
                         )
                     warn(msg)
+
+    def _reify_lazy_config_value(
+        self,
+        name: str,
+        lazy_value: LazyConfigValue,
+        initial: t.Any,
+    ) -> t.Any:
+        """Reify a LazyConfigValue against this instance's own initial value.
+
+        The LazyConfigValue itself is shared (by reference) with the Config
+        object and with every other instance loading the same config, so the
+        reified result must never be cached on the lazy object. Instead, the
+        cache boundary is *per instance*: each instance remembers which lazy
+        increments (identified by their lineage) it has already applied.
+        This keeps two guarantees:
+
+        - two instances (or two classes) reifying the same lazy object each
+          apply the recorded operations to their *own* initial value;
+        - loading the same config into the same instance twice (e.g. via
+          repeated ``update_config``) does not apply the increments twice.
+        """
+        applied = self.__dict__.setdefault("_lazy_config_applied", {})
+        seen = applied.setdefault(name, set())
+        if lazy_value._lineage <= seen:
+            # These exact increments were already applied to this instance
+            # (e.g. update_config re-loading an already-merged config):
+            # keep the current value instead of applying them twice.
+            return getattr(self, name)
+        value = lazy_value.get_value(initial)
+        seen.update(lazy_value._lineage)
+        return value
 
     @observe("config")
     @observe_compat

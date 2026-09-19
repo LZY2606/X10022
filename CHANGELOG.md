@@ -2,6 +2,93 @@
 
 <!-- <START NEW CHANGELOG ENTRY> -->
 
+## 5.16.2 (unreleased) — LazyConfigValue evaluation order and cache boundaries
+
+### Bugs fixed
+
+- **LazyConfigValue no longer leaks reified values across instances.**
+  `LazyConfigValue.get_value` used to memoize its result on the lazy object
+  itself (`self._value`). Because the lazy object is stored by reference in
+  the shared `Config`, the *first* instance's default became the base for
+  every later instance — including instances of other classes and instances
+  with per-instance dynamic `@default` generators. `get_value` is now a pure
+  function of its `initial` argument; reification state lives only on the
+  instance.
+- **`LazyConfigValue.merge_into` no longer mutates or aliases its operands.**
+  Merging stacked configs used to mutate the lower-precedence lazy object in
+  place and share its operation lists with the merged result, so a merge
+  polluted both source configs (and, through `_find_my_config`, the config
+  sections of *base classes*). `merge_into` now returns a fresh
+  `LazyConfigValue` with copied operation lists; both sources stay valid for
+  further independent use.
+
+### Implementation choices
+
+- `get_value` reifies into a fresh `deepcopy(initial)` on every call and the
+  `_value` attribute is removed; `__repr__` always shows the recorded
+  operations (`to_dict()`).
+- Repeat-load idempotency (an adjacent semantic previously provided as a
+  side effect of the global `_value` cache) is preserved with an explicit,
+  correctly scoped mechanism: every `LazyConfigValue` carries a `_lineage`
+  marker (a frozenset of unique ids, unioned by `merge_into`, preserved by
+  `deepcopy`), and each `Configurable` instance records which lineages it
+  has already applied per trait (`_lazy_config_applied`). Loading the same
+  config twice — e.g. repeated `update_config` — no longer double-applies
+  increments, while two instances never share any reification state.
+- Evaluation order is unchanged and is now pinned by tests and docs:
+  class default / `@default` → synchronous `type="default"` observer
+  notification → config increments → `@validate` (exactly once, on the
+  merged value, at the end of the notification hold) → `change` observers.
+
+### Coverage gaps closed
+
+The pre-existing suite covered lazy merge *composition* (`test_merge_multi_lazy*`)
+and single-instance container increments, but never exercised: two instances
+sharing one `Config`, per-instance dynamic defaults under config loading,
+source pollution from `Config.merge`, callback ordering across
+default/validate/observe, or repeat `update_config` with lazy values. The new
+`tests/config/test_lazy_config_evaluation.py` (21 tests) covers all of these,
+including the three value-producing paths (first read, config load, explicit
+assignment) and class-hierarchy section composition.
+
+### Regression protection for adjacent semantics
+
+- `test_repeated_update_config_does_not_double_apply` and
+  `test_update_config_with_new_increments_applies_on_top` pin idempotent
+  re-loads and stacked increments.
+- `test_lazy_config_repr` (updated) keeps the repr informative after the
+  `_value` cache removal.
+- `test_merge_no_copies` (unchanged) still guarantees section objects are
+  shared by merge; only the lazy-value mutation/aliasing was removed.
+- The full pre-existing suite (710 tests) passes unmodified except for the
+  single repr expectation above.
+
+### Most dangerous counterexample
+
+Two instances of one class share a single `Config`, and the trait has a
+per-instance dynamic default:
+
+```python
+class C(Configurable):
+    foo = List(config=True)
+    n = Int(0)
+
+    @default("foo")
+    def _foo_default(self):
+        return [self.n]
+
+
+c = Config()
+c.C.foo.append(99)
+C(config=c, n=7).foo  # [7, 99]
+C(config=c, n=8).foo  # was [7, 99] (first instance's default!); now [8, 99]
+```
+
+The shared lazy object cached the first instance's reified value and served
+it to the second instance — silently binding the wrong default under config
+merging. Regression test:
+`tests/config/test_lazy_config_evaluation.py::test_two_instances_per_instance_dynamic_default`.
+
 ## 5.16.1
 
 ([Full Changelog](https://github.com/ipython/traitlets/compare/v5.16.0...0f8dba11b705ea4401d93330b01bc3b2c74d87f9))

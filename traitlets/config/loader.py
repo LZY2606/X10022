@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import copy
 import functools
+import itertools
 import os
 import re
 import sys
@@ -87,9 +88,28 @@ class LazyConfigValue(HasTraits):
     - append, extend, insert on lists
     - update on dicts
     - update, add on sets
+
+    A LazyConfigValue records *only* the incremental operations. It never
+    caches a reified container: :meth:`get_value` is a pure function of the
+    ``initial`` value it is given, so a single lazy object stored in a
+    shared :class:`Config` can be safely reified against any number of
+    ``HasTraits`` instances (and their distinct defaults) without leaking
+    state from one instance to another.
+
+    Each lazy object carries a ``_lineage`` marker (a frozenset of unique
+    ids) identifying the operation set it records. Merging two lazy objects
+    unions their lineages, and ``copy.deepcopy`` preserves them, so a
+    ``Configurable`` can tell - per instance - whether the increments it is
+    looking at have already been applied to that instance.
     """
 
-    _value = None
+    # monotonic source of unique lineage ids; survives deepcopy because it
+    # lives on the class, not the instance
+    _lineage_counter = itertools.count()
+
+    def __init__(self, *args: t.Any, **kwargs: t.Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._lineage = frozenset({next(self._lineage_counter)})
 
     # list methods
     _extend: List[t.Any] = List()
@@ -115,6 +135,12 @@ class LazyConfigValue(HasTraits):
 
         Self is expected to have higher precedence.
 
+        Neither ``self`` nor ``other`` is mutated: when both are lazy, a
+        *new* LazyConfigValue is returned whose operations are the
+        concatenation of both, so the config objects being merged stay
+        valid for further independent use (no shared list/set/dict state
+        is aliased between the operands and the result).
+
         Parameters
         ----------
         other : LazyConfigValue or container
@@ -125,18 +151,19 @@ class LazyConfigValue(HasTraits):
             if ``other`` is also lazy, a reified container otherwise.
         """
         if isinstance(other, LazyConfigValue):
-            other._extend.extend(self._extend)
-            self._extend = other._extend
-
-            self._prepend.extend(other._prepend)
-
-            other._inserts.extend(self._inserts)
-            self._inserts = other._inserts
-
-            if self._update:
-                other.update(self._update)
-                self._update = other._update
-            return self
+            merged = LazyConfigValue()
+            # lower-precedence (other) operations apply first
+            merged._extend = [*other._extend, *self._extend]
+            merged._prepend = [*self._prepend, *other._prepend]
+            merged._inserts = [*other._inserts, *self._inserts]
+            merged._lineage = other._lineage | self._lineage
+            if other._update is not None:
+                merged._update = other._update.copy()
+                if self._update is not None:
+                    merged._update.update(self._update)
+            elif self._update is not None:
+                merged._update = self._update.copy()
+            return merged
         else:
             # other is a container, reify now.
             return self.get_value(other)
@@ -168,9 +195,13 @@ class LazyConfigValue(HasTraits):
         """construct the value from the initial one
 
         after applying any insert / extend / update changes
+
+        This is a pure function of ``initial``: a fresh deep copy of
+        ``initial`` is returned on every call and no state is stored on
+        the LazyConfigValue, so two instances reifying the same lazy
+        object against different defaults can never observe (or mutate)
+        each other's result.
         """
-        if self._value is not None:
-            return self._value  # type:ignore[unreachable]
         value = copy.deepcopy(initial)
         if isinstance(value, list):
             for idx, obj in self._inserts:
@@ -184,7 +215,6 @@ class LazyConfigValue(HasTraits):
         elif isinstance(value, set):
             if self._update:
                 value.update(self._update)
-        self._value = value
         return value
 
     def to_dict(self) -> dict[str, t.Any]:
@@ -204,10 +234,7 @@ class LazyConfigValue(HasTraits):
         return d
 
     def __repr__(self) -> str:
-        if self._value is not None:
-            return f"<{self.__class__.__name__} value={self._value!r}>"
-        else:
-            return f"<{self.__class__.__name__} {self.to_dict()!r}>"
+        return f"<{self.__class__.__name__} {self.to_dict()!r}>"
 
 
 def _is_section_key(key: str) -> bool:
