@@ -87,6 +87,15 @@ class LazyConfigValue(HasTraits):
     - append, extend, insert on lists
     - update on dicts
     - update, add on sets
+
+    Notes
+    -----
+    A single LazyConfigValue may be reified against several different
+    initial values (e.g. the per-class defaults of several HasTraits
+    instances sharing one Config).  ``get_value`` therefore never caches
+    across calls: each call produces a fresh container derived from the
+    ``initial`` it is given.  ``_value`` only records the most recently
+    reified value for debugging/repr purposes and is never served back.
     """
 
     _value = None
@@ -123,19 +132,32 @@ class LazyConfigValue(HasTraits):
         -------
         LazyConfigValue
             if ``other`` is also lazy, a reified container otherwise.
+
+        Notes
+        -----
+        ``other`` is treated as read-only: it is neither mutated nor
+        aliased.  A single earlier Config (e.g. a system-wide one) may be
+        merged into several later Configs, and must come out of each merge
+        unchanged.  ``self`` is updated in place and returned.
         """
         if isinstance(other, LazyConfigValue):
-            other._extend.extend(self._extend)
-            self._extend = other._extend
-
-            self._prepend.extend(other._prepend)
-
-            other._inserts.extend(self._inserts)
-            self._inserts = other._inserts
-
-            if self._update:
-                other.update(self._update)
-                self._update = other._update
+            # Absorb other's (earlier, lower-precedence) operations into
+            # self, building fresh containers so that ``other`` and its
+            # list/dict/set state are left untouched.
+            if other._extend:
+                self._extend = [*other._extend, *self._extend]
+            if other._prepend:
+                self._prepend = [*self._prepend, *other._prepend]
+            if other._inserts:
+                self._inserts = [*other._inserts, *self._inserts]
+            if other._update:
+                # other's update applies first, self's keys win.
+                # Merge even when self has no update of its own, otherwise
+                # the earlier update would be silently dropped.
+                merged_update = copy.deepcopy(other._update)
+                if self._update:
+                    merged_update.update(self._update)
+                self._update = merged_update
             return self
         else:
             # other is a container, reify now.
@@ -168,9 +190,13 @@ class LazyConfigValue(HasTraits):
         """construct the value from the initial one
 
         after applying any insert / extend / update changes
+
+        Each call reifies a fresh container from ``initial``; the result
+        is intentionally *not* cached across calls.  Caching would bake
+        the first caller's ``initial`` (typically one instance's default)
+        into every later caller, leaking values across instances and
+        across subclasses that override the default.
         """
-        if self._value is not None:
-            return self._value  # type:ignore[unreachable]
         value = copy.deepcopy(initial)
         if isinstance(value, list):
             for idx, obj in self._inserts:
@@ -184,6 +210,7 @@ class LazyConfigValue(HasTraits):
         elif isinstance(value, set):
             if self._update:
                 value.update(self._update)
+        # Record only for repr()/debugging; never served back by get_value.
         self._value = value
         return value
 
@@ -267,7 +294,10 @@ class Config(dict):  # type:ignore[type-arg]
                     # Recursively merge common sub Configs
                     self[k].merge(v)
                 elif isinstance(v, LazyConfigValue):
-                    self[k] = v.merge_into(self[k])
+                    # Merge a copy of the incoming lazy value so that the
+                    # source Config (``other``) is never mutated or aliased:
+                    # one Config may be merged into many targets.
+                    self[k] = copy.deepcopy(v).merge_into(self[k])
                 else:
                     # Plain updates for non-Configs
                     to_update[k] = v

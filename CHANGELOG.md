@@ -2,6 +2,69 @@
 
 <!-- <START NEW CHANGELOG ENTRY> -->
 
+## Unreleased
+
+### Bugs fixed
+
+- `LazyConfigValue` no longer caches its reified value across `get_value()`
+  calls.  Previously the first caller's `initial` (one instance's default)
+  was baked into every later caller, so two `HasTraits` instances sharing
+  one `Config` — most dangerously a subclass overriding `@default` — received
+  the first instance's merged container.  Each call now reifies a fresh
+  container from the `initial` it is given; `_value` is kept only as
+  debug/repr context and is never served back.
+- `LazyConfigValue.merge_into()` no longer mutates or aliases the earlier
+  (lower-precedence) lazy value it absorbs, and no longer drops the earlier
+  value's `update` operations when the later value recorded none.
+  `Config.merge()` now merges a deep copy of an incoming `LazyConfigValue`,
+  so a source `Config` (e.g. a system-wide file merged into many targets)
+  is never mutated or aliased by the merge.
+
+### Implementation choices
+
+- Fixes are scoped to `traitlets/config/loader.py`; the descriptor and
+  notification machinery in `traitlets/traitlets.py` is unchanged.  The
+  per-instance deepcopy in `Configurable._load_config` already isolated
+  instance state; the missing boundary was upstream, in the lazy value
+  itself.
+- `Config.merge()` keeps its deliberate no-copy semantics for sections and
+  plain values (pinned by `test_merge_no_copies`); only `LazyConfigValue`
+  payloads are copied, because they are mutable accumulators that
+  `merge_into` used to mutate in place.
+
+### Coverage gaps closed
+
+- No test previously instantiated two configurables from one `Config` with
+  container traits, so the cross-instance cache pollution was invisible.
+- No test checked that `Config.merge()` leaves its argument intact, or that
+  an earlier config's `update` survives a merge with a later config that
+  only used list operations.
+- No test recorded the callback order (`@default` -> `@validate` ->
+  `@observe`) across the config-load, first-read, and explicit-assignment
+  paths.
+
+### Adjacent-semantics regression guards
+
+New directed tests in `tests/config/test_lazy_eval_order.py` pin, beyond the
+bug fixes themselves: merge compounding order for `extend`/`prepend`/
+`insert`/`update` across configs; class-hierarchy section precedence (child
+wins, lazy ops from parent and child sections compound); `@validate` running
+exactly once on the final merged value during config load and not at all on
+first-read defaults; `TraitError` from `@validate` propagating with trait
+context during config load; and change-event `old` being `Undefined` when a
+container default was never materialized by a read.
+
+### Most dangerous counterexample
+
+One `Config` with `cfg.Base.xs.append(2)` applied to `Base` (default `[1]`)
+and to `Child(Base)` whose `@default` returns `[10]`.  Before the fix,
+whichever class instantiated first determined both results: the second got
+the first's merged base (`[1, 2]` for both).  After the fix each gets its
+own base merged (`[1, 2]` and `[10, 2]`, in either instantiation order).
+Regression test:
+`tests/config/test_lazy_eval_order.py::test_lazy_value_respects_subclass_default`
+(dict counterpart: `test_lazy_dict_update_respects_subclass_default`).
+
 ## 5.16.1
 
 ([Full Changelog](https://github.com/ipython/traitlets/compare/v5.16.0...0f8dba11b705ea4401d93330b01bc3b2c74d87f9))
